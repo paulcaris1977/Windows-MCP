@@ -1,6 +1,10 @@
 from contextlib import asynccontextmanager
 from windows_mcp.config import enable_debug
-from windows_mcp.infrastructure.config import ControlConfig, validate_idle_timeout
+from windows_mcp.infrastructure.config import (
+    ControlConfig,
+    SafeguardsConfig,
+    validate_idle_timeout,
+)
 from windows_mcp.infrastructure import (
     AuthKeyMiddleware,
     OAuthOnlyMiddleware,
@@ -68,6 +72,7 @@ analytics: Any | None = None
 screen_size: Any | None = None
 _mcp: FastMCP | None = None
 _control_config = ControlConfig()
+_safeguards_config = SafeguardsConfig()
 _control_notifier: Any | None = None
 
 instructions = dedent("""
@@ -223,6 +228,27 @@ def _exit_missing_dependency(exc: ModuleNotFoundError) -> NoReturn:
     sys.exit(1)
 
 
+def _report_startup_time() -> None:
+    """Print seconds from process creation to ready on stderr when profiling is asked for.
+
+    Enabled by ``WINDOWS_MCP_PROFILE_STARTUP`` (``1``/``true``/``yes``/``on``). The
+    line lands in the MCP host's server log, which is where a slow start shows up.
+    """
+    if os.getenv("WINDOWS_MCP_PROFILE_STARTUP", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return
+    import time
+
+    import psutil
+
+    elapsed = time.time() - psutil.Process().create_time()
+    click.echo(f"windows-mcp: ready {elapsed:.2f}s after process start", err=True)
+
+
 def _start_watchdog(desktop):
     """Create and start the UIA WatchDog, or return None if it is unavailable.
 
@@ -266,6 +292,7 @@ def _build_mcp() -> FastMCP:
     except ModuleNotFoundError as exc:
         _exit_missing_dependency(exc)
     from windows_mcp.tools.control_notifications import ControlNotifier, ControlToolGate
+    from windows_mcp.infrastructure.safeguards import Safeguards, SafeguardMiddleware
     from windows_mcp.desktop.control import get_controller
     from windows_mcp.desktop import control_overlay
 
@@ -328,7 +355,8 @@ def _build_mcp() -> FastMCP:
         nonlocal control_loop
         control_loop = asyncio.get_running_loop()
 
-        if os.getenv("ANONYMIZED_TELEMETRY", "true").lower() != "false":
+        # Opt-in in this fork: no usage data leaves the machine unless asked for.
+        if os.getenv("ANONYMIZED_TELEMETRY", "false").lower() == "true":
             analytics = PostHogAnalytics()
         desktop = Desktop()
         screen_size = desktop.get_screen_size()
@@ -350,6 +378,7 @@ def _build_mcp() -> FastMCP:
             if controller.enabled:
                 notifier.start()
             logger.debug("Server started, entering main loop")
+            _report_startup_time()
             yield
         finally:
             await notifier.close()
@@ -368,6 +397,8 @@ def _build_mcp() -> FastMCP:
                     control_loop = None
 
     _mcp = FastMCP(name="windows-mcp", instructions=instructions, lifespan=lifespan)
+    # Outermost, so a refused call never waits for or takes the desktop lease.
+    _mcp.add_middleware(SafeguardMiddleware(Safeguards(_safeguards_config)))
     _mcp.add_middleware(ControlToolGate(controller, notifier))
     register_all(_mcp, get_desktop=_get_desktop, get_analytics=_get_analytics)
     return _mcp
@@ -719,7 +750,7 @@ def serve(
     control_idle_timeout,
     control_policy,
 ):
-    global _control_config
+    global _control_config, _safeguards_config
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     install_selfpipe_guard()
     if transport == Transport.STDIO.value:
@@ -737,6 +768,7 @@ def serve(
     except (FileNotFoundError, ValueError) as exc:
         raise click.ClickException(str(exc))
     _control_config = cfg.control
+    _safeguards_config = cfg.safeguards
     _control_config.policy = _choose_value(
         ctx, "control_policy", control_policy, cfg.control.policy, "relaxed"
     )

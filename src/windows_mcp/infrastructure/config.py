@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import math
+import os
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,12 +52,42 @@ class ControlConfig:
     policy: str = "relaxed"
 
 
+def _default_protected_paths() -> list[str]:
+    env = os.environ
+    return [
+        env.get("SystemRoot", r"C:\Windows"),
+        env.get("ProgramFiles", r"C:\Program Files"),
+        env.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        env.get("ProgramData", r"C:\ProgramData"),
+    ]
+
+
+@dataclass
+class SafeguardsConfig:
+    enabled: bool = True
+    # Built-in PowerShell deny rules; set false only if you accept the risk.
+    powershell_default_deny: bool = True
+    # Extra regexes (case-insensitive) refused in PowerShell commands.
+    powershell_deny: list[str] = field(default_factory=list)
+    # Trees the FileSystem tool may not write, move, copy into, or delete.
+    protected_paths: list[str] = field(default_factory=_default_protected_paths)
+    # When non-empty, FileSystem writes are allowed only inside these trees.
+    allowed_write_roots: list[str] = field(default_factory=list)
+    # Refuse Registry set/delete under HKLM, HKCR and HKU.
+    protect_machine_registry: bool = True
+    # Outlook may create drafts freely; sending needs this to be true.
+    outlook_allow_send: bool = False
+    # Append one JSON line per tool call to this file ("" disables auditing).
+    audit_log: str = str(Path("~/.windows-mcp/audit.jsonl").expanduser())
+
+
 @dataclass
 class WindowsMCPConfig:
     server: ServerConfig = field(default_factory=ServerConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
+    safeguards: SafeguardsConfig = field(default_factory=SafeguardsConfig)
     source_path: Path | None = None
 
 
@@ -130,6 +163,7 @@ def load_config(path: Path | None) -> WindowsMCPConfig:
     security = data.get("security", {})
     tools = data.get("tools", {})
     control = data.get("control", {})
+    safeguards = data.get("safeguards", {})
 
     _VALID_TRANSPORTS = {"stdio", "sse", "streamable-http"}
     if "transport" in server:
@@ -197,6 +231,26 @@ def load_config(path: Path | None) -> WindowsMCPConfig:
                 raise ValueError(f"control.{key} must be between 40 and 2000")
             setattr(cfg.control, key, value)
 
+    for key in (
+        "enabled",
+        "powershell_default_deny",
+        "protect_machine_registry",
+        "outlook_allow_send",
+    ):
+        if key in safeguards:
+            setattr(cfg.safeguards, key, _strict_bool(safeguards[key], f"safeguards.{key}"))
+    for key in ("powershell_deny", "protected_paths", "allowed_write_roots"):
+        if key in safeguards:
+            setattr(cfg.safeguards, key, _list_of_strings(safeguards[key], f"safeguards.{key}"))
+    for pattern in cfg.safeguards.powershell_deny:
+        try:
+            re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"safeguards.powershell_deny: invalid regex {pattern!r}: {exc}")
+    if "audit_log" in safeguards:
+        raw = _strict_string(safeguards["audit_log"], "safeguards.audit_log")
+        cfg.safeguards.audit_log = str(Path(raw).expanduser()) if raw else ""
+
     cfg.source_path = path
     return cfg
 
@@ -259,5 +313,25 @@ def write_config(cfg: WindowsMCPConfig, path: Path) -> None:
         control_lines.append(f"idle_timeout_seconds = {ctrl.idle_timeout_seconds}")
     if control_lines:
         lines += ["[control]", *control_lines, ""]
+
+    # json.dumps output is a valid TOML basic string (backslashes in Windows paths escaped).
+    sg, default_sg = cfg.safeguards, SafeguardsConfig()
+    safeguard_lines = []
+    for key in (
+        "enabled",
+        "powershell_default_deny",
+        "protect_machine_registry",
+        "outlook_allow_send",
+    ):
+        if getattr(sg, key) != getattr(default_sg, key):
+            safeguard_lines.append(f"{key} = {str(getattr(sg, key)).lower()}")
+    for key in ("powershell_deny", "protected_paths", "allowed_write_roots"):
+        if getattr(sg, key) != getattr(default_sg, key):
+            items = ", ".join(json.dumps(item) for item in getattr(sg, key))
+            safeguard_lines.append(f"{key} = [{items}]")
+    if sg.audit_log != default_sg.audit_log:
+        safeguard_lines.append(f"audit_log = {json.dumps(sg.audit_log)}")
+    if safeguard_lines:
+        lines += ["[safeguards]", *safeguard_lines, ""]
 
     path.write_text("\n".join(lines), encoding="utf-8")
